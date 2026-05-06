@@ -25,6 +25,7 @@ import yt_dlp
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
+PORT = int(os.getenv("PORT", "10000"))
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
