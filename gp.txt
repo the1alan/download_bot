@@ -49,7 +49,7 @@ download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 search_results: dict[int, list[dict]] = {}
 current_page: dict[int, int] = {}
-pending_urls: dict[int, str] = {}
+pending_youtube_urls: dict[int, str] = {}
 
 
 def is_url(text: str) -> bool:
@@ -69,12 +69,9 @@ def is_youtube_url(url: str) -> bool:
     return any(host == h or host.endswith("." + h) for h in youtube_hosts)
 
 
-def is_video_platform_url(url: str) -> bool:
+def is_direct_video_url(url: str) -> bool:
     host = get_url_host(url)
     video_hosts = (
-        "youtube.com",
-        "youtu.be",
-        "music.youtube.com",
         "tiktok.com",
         "instagram.com",
         "instagr.am",
@@ -87,8 +84,11 @@ def is_video_platform_url(url: str) -> bool:
 def safe_title(title: str | None, fallback: str = "media") -> str:
     if not title:
         return fallback
+
     title = re.sub(r"[\\/:*?\"<>|]+", "_", title)
-    return title[:120].strip() or fallback
+    title = title.strip()
+
+    return title[:120] or fallback
 
 
 def create_job_dir(chat_id: int) -> Path:
@@ -156,6 +156,7 @@ def build_page_keyboard(tracks: list[dict], page: int = 0, per_page: int = 10) -
     page_tracks = tracks[start:end]
 
     buttons = []
+
     for i, track in enumerate(page_tracks, start=start):
         buttons.append([
             InlineKeyboardButton(
@@ -165,8 +166,10 @@ def build_page_keyboard(tracks: list[dict], page: int = 0, per_page: int = 10) -
         ])
 
     nav = []
+
     if page > 0:
         nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page_{page - 1}"))
+
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"page_{page + 1}"))
 
@@ -180,27 +183,11 @@ def build_youtube_format_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🎵 Скачать MP3", callback_data="yt_audio"),
-                InlineKeyboardButton(text="🎬 Скачать MP4", callback_data="yt_video"),
+                InlineKeyboardButton(text="🎵 MP3", callback_data="yt_audio"),
+                InlineKeyboardButton(text="🎬 MP4", callback_data="yt_video"),
             ],
             [
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel"),
-            ],
-        ]
-    )
-
-
-def build_media_action_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🎬 Скачать видео", callback_data="direct_video"),
-            ],
-            [
-                InlineKeyboardButton(text="🎵 Попробовать как аудио", callback_data="direct_audio"),
-            ],
-            [
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_youtube"),
             ],
         ]
     )
@@ -268,6 +255,7 @@ async def search_all(query: str, limit: int = 10) -> list[dict]:
 
         seen = set()
         unique = []
+
         for item in results:
             if item["url"] not in seen:
                 seen.add(item["url"])
@@ -284,15 +272,20 @@ def extract_metadata(url: str) -> dict | None:
         "skip_download": True,
     })
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        logging.warning("Metadata extract error: %s", e)
+        return None
 
 
 def validate_metadata(info: dict | None) -> tuple[bool, str]:
     if not info:
-        return False, "❌ Не удалось получить информацию о файле."
+        return True, ""
 
     duration = info.get("duration")
+
     if duration and duration > MAX_DURATION_SECONDS:
         return (
             False,
@@ -312,6 +305,7 @@ async def download_audio(url: str, chat_id: int) -> tuple[Path | None, str | Non
 
         info = extract_metadata(url)
         ok, error = validate_metadata(info)
+
         if not ok:
             return None, None, workdir, error
 
@@ -330,10 +324,18 @@ async def download_audio(url: str, chat_id: int) -> tuple[Path | None, str | Non
             ],
         })
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+        except Exception as e:
+            logging.exception("Audio download error")
+            return None, title, workdir, f"❌ Не удалось скачать аудио: {e}"
 
         path = get_largest_media_file(workdir)
+
+        if not path:
+            return None, title, workdir, "❌ Не удалось скачать аудио."
+
         return path, title, workdir, None
 
     return await asyncio.to_thread(_download)
@@ -348,6 +350,7 @@ async def download_video(url: str, chat_id: int) -> tuple[Path | None, str | Non
 
         info = extract_metadata(url)
         ok, error = validate_metadata(info)
+
         if not ok:
             return None, None, workdir, error
 
@@ -365,10 +368,18 @@ async def download_video(url: str, chat_id: int) -> tuple[Path | None, str | Non
             "merge_output_format": "mp4",
         })
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+        except Exception as e:
+            logging.exception("Video download error")
+            return None, title, workdir, f"❌ Не удалось скачать видео: {e}"
 
         path = get_largest_media_file(workdir)
+
+        if not path:
+            return None, title, workdir, "❌ Не удалось скачать видео."
+
         return path, title, workdir, None
 
     return await asyncio.to_thread(_download)
@@ -384,10 +395,11 @@ async def send_audio_and_clean(chat_id: int, path: Path, status, title: str | No
             audio=FSInputFile(path),
             title=title or "Аудио",
         )
+
         await status.delete()
 
     except Exception as e:
-        logging.exception("Ошибка отправки аудио")
+        logging.exception("Audio send error")
         await status.edit_text(f"❌ Ошибка отправки аудио: {e}")
 
     finally:
@@ -405,53 +417,42 @@ async def send_video_and_clean(chat_id: int, path: Path, status, title: str | No
             caption=(title or "Видео")[:1024],
             supports_streaming=True,
         )
+
         await status.delete()
 
     except Exception as e:
-        logging.exception("Ошибка отправки видео")
+        logging.exception("Video send error")
         await status.edit_text(f"❌ Ошибка отправки видео: {e}")
 
     finally:
         cleanup_path(workdir or path.parent)
 
 
-async def run_download_job(message_or_callback_message: Message, url: str, mode: str):
-    chat_id = message_or_callback_message.chat.id
+async def run_download_job(message: Message, url: str, mode: str):
+    chat_id = message.chat.id
 
     async with download_semaphore:
         if mode == "audio":
-            status = await message_or_callback_message.answer("⏳ Скачиваю аудио...")
+            status = await message.answer("⏳ Скачиваю MP3...")
             path, title, workdir, error = await download_audio(url, chat_id)
 
             if error:
                 cleanup_path(workdir)
                 return await status.edit_text(error)
 
-            if not path:
-                cleanup_path(workdir)
-                return await status.edit_text("❌ Не удалось скачать аудио.")
-
             return await send_audio_and_clean(chat_id, path, status, title, workdir)
 
         if mode == "video":
-            status = await message_or_callback_message.answer("⏳ Скачиваю видео...")
+            status = await message.answer("⏳ Скачиваю видео...")
             path, title, workdir, error = await download_video(url, chat_id)
 
             if error:
                 cleanup_path(workdir)
                 return await status.edit_text(error)
 
-            if not path:
-                cleanup_path(workdir)
-                return await status.edit_text(
-                    "❌ Не удалось скачать видео.\n\n"
-                    "Возможные причины: приватный контент, ограничение платформы, "
-                    "нужна авторизация или ссылка не поддерживается."
-                )
-
             return await send_video_and_clean(chat_id, path, status, title, workdir)
 
-        return await message_or_callback_message.answer("❌ Неизвестный режим скачивания.")
+    return await message.answer("❌ Неизвестный режим скачивания.")
 
 
 @dp.message(CommandStart())
@@ -460,7 +461,7 @@ async def start(message: Message):
         "🎵 Привет. Я скачиваю аудио и видео.\n\n"
         "▫️ Отправь название или исполнителя — найду треки в YouTube/SoundCloud.\n"
         "▫️ Отправь YouTube-ссылку — предложу MP3 или MP4.\n"
-        "▫️ Отправь TikTok / Instagram / Pinterest — попробую скачать видео.\n\n"
+        "▫️ Отправь TikTok / Instagram / Pinterest — сразу скачаю видео.\n\n"
         "Лимиты:\n"
         f"▫️ Размер файла: до {MAX_FILE_SIZE // 1024 // 1024} МБ\n"
         f"▫️ Длительность: до {MAX_DURATION_SECONDS // 60} мин\n"
@@ -477,19 +478,16 @@ async def handle_message(message: Message):
 
     if is_url(text):
         chat_id = message.chat.id
-        pending_urls[chat_id] = text
 
         if is_youtube_url(text):
+            pending_youtube_urls[chat_id] = text
             return await message.answer(
-                "Выбери формат для YouTube:",
+                "YouTube: что скачать?",
                 reply_markup=build_youtube_format_keyboard(),
             )
 
-        if is_video_platform_url(text):
-            return await message.answer(
-                "Что скачать по этой ссылке?",
-                reply_markup=build_media_action_keyboard(),
-            )
+        if is_direct_video_url(text):
+            return await run_download_job(message, text, "video")
 
         return await run_download_job(message, text, "audio")
 
@@ -517,19 +515,21 @@ async def handle_callback(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     data = callback.data or ""
 
-    if data == "cancel":
-        pending_urls.pop(chat_id, None)
+    if data == "cancel_youtube":
+        pending_youtube_urls.pop(chat_id, None)
         await callback.message.edit_text("Отменено.")
         return await callback.answer()
 
-    if data in {"yt_audio", "yt_video", "direct_audio", "direct_video"}:
-        url = pending_urls.get(chat_id)
+    if data in {"yt_audio", "yt_video"}:
+        url = pending_youtube_urls.pop(chat_id, None)
+
         if not url:
             return await callback.answer("Ссылка устарела. Отправь её заново.", show_alert=True)
 
-        mode = "audio" if data.endswith("_audio") else "video"
+        mode = "audio" if data == "yt_audio" else "video"
 
         await callback.answer()
+
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -554,6 +554,14 @@ async def handle_callback(callback: CallbackQuery):
         url = tracks[idx]["url"]
 
         await callback.answer()
+
+        if is_youtube_url(url):
+            pending_youtube_urls[chat_id] = url
+            return await callback.message.answer(
+                "YouTube: что скачать?",
+                reply_markup=build_youtube_format_keyboard(),
+            )
+
         return await run_download_job(callback.message, url, "audio")
 
     if data.startswith("page_"):
@@ -573,6 +581,7 @@ async def handle_callback(callback: CallbackQuery):
             f"🎶 Результаты поиска, страница {page + 1}:",
             reply_markup=build_page_keyboard(tracks, page),
         )
+
         return await callback.answer()
 
     return await callback.answer("Неизвестная команда.", show_alert=True)

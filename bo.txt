@@ -19,9 +19,11 @@ from aiogram.types import (
     Message,
 )
 from dotenv import load_dotenv
-import yt_dlp
+import pytubefix
+from pytubefix import YouTube, Search
+from pytubefix.cli import on_progress
 
-
+# Загрузка переменных окружения
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -37,26 +39,32 @@ MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "1200"))
 TMP_ROOT = Path(os.getenv("TMP_ROOT", "tmp_downloads"))
 TMP_TTL_SECONDS = int(os.getenv("TMP_TTL_SECONDS", "3600"))
 
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
+# Инициализация бота и диспетчера
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# Семафор для ограничения одновременных загрузок
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-search_results: dict[int, list[dict]] = {}
-current_page: dict[int, int] = {}
-pending_urls: dict[int, str] = {}
+# Хранилища данных
+search_results = {}
+current_page = {}
+pending_urls = {}
 
 
 def is_url(text: str) -> bool:
+    """Проверяет, является ли текст URL"""
     return bool(re.match(r"^https?://\S+$", text.strip(), re.IGNORECASE))
 
 
 def get_url_host(url: str) -> str:
+    """Извлекает хост из URL"""
     try:
         return urlparse(url).netloc.lower().replace("www.", "")
     except Exception:
@@ -64,12 +72,14 @@ def get_url_host(url: str) -> str:
 
 
 def is_youtube_url(url: str) -> bool:
+    """Проверяет, является ли URL ссылкой на YouTube"""
     host = get_url_host(url)
     youtube_hosts = ("youtube.com", "youtu.be", "music.youtube.com")
     return any(host == h or host.endswith("." + h) for h in youtube_hosts)
 
 
 def is_video_platform_url(url: str) -> bool:
+    """Проверяет, является ли URL ссылкой на видеоплатформу"""
     host = get_url_host(url)
     video_hosts = (
         "youtube.com",
@@ -85,18 +95,21 @@ def is_video_platform_url(url: str) -> bool:
 
 
 def safe_title(title: str | None, fallback: str = "media") -> str:
+    """Очищает название файла от недопустимых символов"""
     if not title:
         return fallback
-    title = re.sub(r"[\\/:*?\"<>|]+", "_", title)
+    title = re.sub(r'[\\/:*?"<>|]+', "_", title)
     return title[:120].strip() or fallback
 
 
 def create_job_dir(chat_id: int) -> Path:
+    """Создает временную директорию для загрузки"""
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix=f"job_{chat_id}_", dir=TMP_ROOT))
 
 
 def cleanup_path(path: Path | str | None) -> None:
+    """Удаляет файл или директорию"""
     if not path:
         return
 
@@ -112,6 +125,7 @@ def cleanup_path(path: Path | str | None) -> None:
 
 
 def cleanup_old_tmp_dirs() -> None:
+    """Удаляет старые временные директории"""
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
     now = time.time()
 
@@ -124,20 +138,33 @@ def cleanup_old_tmp_dirs() -> None:
 
 
 async def periodic_cleanup() -> None:
+    """Периодическая очистка временных файлов"""
     while True:
         await asyncio.to_thread(cleanup_old_tmp_dirs)
         await asyncio.sleep(15 * 60)
 
 
 def get_largest_media_file(workdir: Path) -> Path | None:
+    """Находит самый большой медиафайл в директории"""
     allowed_ext = {
-        ".mp3", ".m4a", ".opus", ".ogg", ".wav",
-        ".mp4", ".mov", ".mkv", ".webm",
-        ".jpg", ".jpeg", ".png", ".webp",
+        ".mp3",
+        ".m4a",
+        ".opus",
+        ".ogg",
+        ".wav",
+        ".mp4",
+        ".mov",
+        ".mkv",
+        ".webm",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
     }
 
     files = [
-        p for p in workdir.rglob("*")
+        p
+        for p in workdir.rglob("*")
         if p.is_file()
         and p.suffix.lower() in allowed_ext
         and not p.name.endswith(".part")
@@ -149,7 +176,12 @@ def get_largest_media_file(workdir: Path) -> Path | None:
     return max(files, key=lambda p: p.stat().st_size)
 
 
-def build_page_keyboard(tracks: list[dict], page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
+def build_page_keyboard(
+    tracks: list[dict],
+    page: int = 0,
+    per_page: int = 10,
+) -> InlineKeyboardMarkup:
+    """Создает клавиатуру с результатами поиска"""
     total_pages = max(1, -(-len(tracks) // per_page))
     start = page * per_page
     end = start + per_page
@@ -157,18 +189,32 @@ def build_page_keyboard(tracks: list[dict], page: int = 0, per_page: int = 10) -
 
     buttons = []
     for i, track in enumerate(page_tracks, start=start):
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{i + 1}. {track['title'][:50]}",
-                callback_data=f"dl_{i}",
-            )
-        ])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{i + 1}. {track['title'][:50]}",
+                    callback_data=f"dl_{i}",
+                )
+            ]
+        )
 
     nav = []
+
     if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page_{page - 1}"))
+        nav.append(
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=f"page_{page - 1}",
+            )
+        )
+
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"page_{page + 1}"))
+        nav.append(
+            InlineKeyboardButton(
+                text="Вперёд ➡️",
+                callback_data=f"page_{page + 1}",
+            )
+        )
 
     if nav:
         buttons.append(nav)
@@ -177,11 +223,12 @@ def build_page_keyboard(tracks: list[dict], page: int = 0, per_page: int = 10) -
 
 
 def build_youtube_format_keyboard() -> InlineKeyboardMarkup:
+    """Создает клавиатуру выбора формата для YouTube"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🎵 Скачать MP3", callback_data="yt_audio"),
-                InlineKeyboardButton(text="🎬 Скачать MP4", callback_data="yt_video"),
+                InlineKeyboardButton(text="� Скачать MP3", callback_data="yt_audio"),
+                InlineKeyboardButton(text="� Скачать MP4", callback_data="yt_video"),
             ],
             [
                 InlineKeyboardButton(text="❌ Отмена", callback_data="cancel"),
@@ -190,23 +237,8 @@ def build_youtube_format_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def build_media_action_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🎬 Скачать видео", callback_data="direct_video"),
-            ],
-            [
-                InlineKeyboardButton(text="🎵 Попробовать как аудио", callback_data="direct_audio"),
-            ],
-            [
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel"),
-            ],
-        ]
-    )
-
-
-async def check_file_or_report(path: Path, status) -> bool:
+async def check_file_or_report(path: Path, status: Message) -> bool:
+    """Проверяет размер файла перед отправкой"""
     try:
         size = path.stat().st_size
     except OSError:
@@ -223,72 +255,51 @@ async def check_file_or_report(path: Path, status) -> bool:
     return True
 
 
-SEARCH_OPTS = {
-    "quiet": True,
-    "extract_flat": True,
-    "noplaylist": True,
-}
-
-
-def ytdlp_base_opts() -> dict:
-    return {
-        "quiet": True,
-        "no_warnings": False,
-        "ignoreerrors": True,
-        "noplaylist": True,
-    }
+# Настройки не требуются для pytubefix
 
 
 async def search_all(query: str, limit: int = 10) -> list[dict]:
+    """Поиск треков в YouTube"""
+
     def _search() -> list[dict]:
         results = []
 
-        with yt_dlp.YoutubeDL(SEARCH_OPTS) as ydl:
-            try:
-                yt_info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-                for entry in yt_info.get("entries", []) or []:
-                    if entry and entry.get("id") and entry.get("title"):
-                        results.append({
-                            "title": f"[YT] {entry['title']}",
-                            "url": f"https://www.youtube.com/watch?v={entry['id']}",
-                        })
-            except Exception as e:
-                logging.warning("YouTube search error: %s", e)
+        try:
+            search = Search(query)
+            
+            for video in search.videos[:limit]:
+                if video and video.video_id and video.title:
+                    results.append(
+                        {
+                            "title": f"[YT] {video.title}",
+                            "url": f"https://www.youtube.com/watch?v={video.video_id}",
+                        }
+                    )
 
-            try:
-                sc_info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
-                for entry in sc_info.get("entries", []) or []:
-                    if entry and entry.get("url") and entry.get("title"):
-                        results.append({
-                            "title": f"[SC] {entry['title']}",
-                            "url": entry["url"],
-                        })
-            except Exception as e:
-                logging.warning("SoundCloud search error: %s", e)
+        except Exception as e:
+            logging.warning("YouTube search error: %s", e)
 
-        seen = set()
-        unique = []
-        for item in results:
-            if item["url"] not in seen:
-                seen.add(item["url"])
-                unique.append(item)
-
-        return unique
+        return results
 
     return await asyncio.to_thread(_search)
 
 
 def extract_metadata(url: str) -> dict | None:
-    opts = ytdlp_base_opts()
-    opts.update({
-        "skip_download": True,
-    })
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    """Извлекает метаданные без скачивания"""
+    try:
+        yt = YouTube(url, on_progress_callback=on_progress)
+        return {
+            "title": yt.title,
+            "duration": yt.length,
+            "author": yt.author,
+        }
+    except Exception as e:
+        logging.error("Ошибка извлечения метаданных: %s", e)
+        return None
 
 
 def validate_metadata(info: dict | None) -> tuple[bool, str]:
+    """Проверяет метаданные на соответствие лимитам"""
     if not info:
         return False, "❌ Не удалось получить информацию о файле."
 
@@ -297,84 +308,113 @@ def validate_metadata(info: dict | None) -> tuple[bool, str]:
         return (
             False,
             f"⚠️ Слишком длинное медиа: {duration // 60} мин.\n"
-            f"Лимит: {MAX_DURATION_SECONDS // 60} мин."
+            f"Лимит: {MAX_DURATION_SECONDS // 60} мин.",
         )
 
     return True, ""
 
 
-async def download_audio(url: str, chat_id: int) -> tuple[Path | None, str | None, Path | None, str | None]:
+async def download_audio(
+    url: str,
+    chat_id: int,
+) -> tuple[Path | None, str | None, Path | None, str | None]:
+    """Скачивает аудио с URL"""
     workdir = None
 
     def _download():
         nonlocal workdir
+
         workdir = create_job_dir(chat_id)
 
         info = extract_metadata(url)
         ok, error = validate_metadata(info)
+
         if not ok:
             return None, None, workdir, error
 
         title = safe_title(info.get("title") if info else None, "audio")
 
-        opts = ytdlp_base_opts()
-        opts.update({
-            "format": "bestaudio/best",
-            "outtmpl": str(workdir / "%(title).120s_%(id)s.%(ext)s"),
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-        })
+        try:
+            yt = YouTube(url, on_progress_callback=on_progress)
+            audio_stream = yt.streams.get_audio_only()
+            
+            if not audio_stream:
+                return None, None, workdir, "❌ Аудио поток не найден"
+            
+            output_file = audio_stream.download(
+                output_path=str(workdir),
+                filename=f"{safe_title(yt.title)}.mp4"
+            )
+            
+            path = Path(output_file)
+            
+        except Exception as e:
+            logging.error("Ошибка скачивания аудио: %s", e)
+            return None, None, workdir, f"❌ Ошибка скачивания: {str(e)[:100]}"
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)
-
-        path = get_largest_media_file(workdir)
         return path, title, workdir, None
 
     return await asyncio.to_thread(_download)
 
 
-async def download_video(url: str, chat_id: int) -> tuple[Path | None, str | None, Path | None, str | None]:
+async def download_video(
+    url: str,
+    chat_id: int,
+) -> tuple[Path | None, str | None, Path | None, str | None]:
+    """Скачивает видео с URL"""
     workdir = None
 
     def _download():
         nonlocal workdir
+
         workdir = create_job_dir(chat_id)
 
         info = extract_metadata(url)
         ok, error = validate_metadata(info)
+
         if not ok:
             return None, None, workdir, error
 
         title = safe_title(info.get("title") if info else None, "video")
 
-        opts = ytdlp_base_opts()
-        opts.update({
-            "format": (
-                "bestvideo[ext=mp4][height<=720][filesize<45M]+bestaudio[ext=m4a]/"
-                "best[ext=mp4][height<=720][filesize<45M]/"
-                "best[ext=mp4][height<=720]/"
-                "best"
-            ),
-            "outtmpl": str(workdir / "%(title).120s_%(id)s.%(ext)s"),
-            "merge_output_format": "mp4",
-        })
+        try:
+            yt = YouTube(url, on_progress_callback=on_progress)
+            
+            # Пытаемся получить видео 720p или ниже
+            video_stream = (
+                yt.streams.filter(progressive=True, file_extension='mp4', resolution='720p').first() or
+                yt.streams.filter(progressive=True, file_extension='mp4', resolution='480p').first() or
+                yt.streams.filter(progressive=True, file_extension='mp4', resolution='360p').first() or
+                yt.streams.filter(progressive=True, file_extension='mp4').first()
+            )
+            
+            if not video_stream:
+                return None, None, workdir, "❌ Видео поток не найден"
+            
+            output_file = video_stream.download(
+                output_path=str(workdir),
+                filename=f"{safe_title(yt.title)}.mp4"
+            )
+            
+            path = Path(output_file)
+            
+        except Exception as e:
+            logging.error("Ошибка скачивания видео: %s", e)
+            return None, None, workdir, f"❌ Ошибка скачивания: {str(e)[:100]}"
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)
-
-        path = get_largest_media_file(workdir)
         return path, title, workdir, None
 
     return await asyncio.to_thread(_download)
 
 
-async def send_audio_and_clean(chat_id: int, path: Path, status, title: str | None, workdir: Path | None):
+async def send_audio_and_clean(
+    chat_id: int,
+    path: Path,
+    status: Message,
+    title: str | None,
+    workdir: Path | None,
+):
+    """Отправляет аудио и очищает временные файлы"""
     try:
         if not await check_file_or_report(path, status):
             return
@@ -384,6 +424,7 @@ async def send_audio_and_clean(chat_id: int, path: Path, status, title: str | No
             audio=FSInputFile(path),
             title=title or "Аудио",
         )
+
         await status.delete()
 
     except Exception as e:
@@ -394,7 +435,14 @@ async def send_audio_and_clean(chat_id: int, path: Path, status, title: str | No
         cleanup_path(workdir or path.parent)
 
 
-async def send_video_and_clean(chat_id: int, path: Path, status, title: str | None, workdir: Path | None):
+async def send_video_and_clean(
+    chat_id: int,
+    path: Path,
+    status: Message,
+    title: str | None,
+    workdir: Path | None,
+):
+    """Отправляет видео и очищает временные файлы"""
     try:
         if not await check_file_or_report(path, status):
             return
@@ -405,6 +453,7 @@ async def send_video_and_clean(chat_id: int, path: Path, status, title: str | No
             caption=(title or "Видео")[:1024],
             supports_streaming=True,
         )
+
         await status.delete()
 
     except Exception as e:
@@ -416,11 +465,13 @@ async def send_video_and_clean(chat_id: int, path: Path, status, title: str | No
 
 
 async def run_download_job(message_or_callback_message: Message, url: str, mode: str):
+    """Запускает задачу скачивания"""
     chat_id = message_or_callback_message.chat.id
 
     async with download_semaphore:
         if mode == "audio":
             status = await message_or_callback_message.answer("⏳ Скачиваю аудио...")
+
             path, title, workdir, error = await download_audio(url, chat_id)
 
             if error:
@@ -435,6 +486,7 @@ async def run_download_job(message_or_callback_message: Message, url: str, mode:
 
         if mode == "video":
             status = await message_or_callback_message.answer("⏳ Скачиваю видео...")
+
             path, title, workdir, error = await download_video(url, chat_id)
 
             if error:
@@ -456,11 +508,12 @@ async def run_download_job(message_or_callback_message: Message, url: str, mode:
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    """Обработчик команды /start"""
     await message.answer(
-        "🎵 Привет. Я скачиваю аудио и видео.\n\n"
+        "🎵 Привет! Я скачиваю аудио и видео.\n\n"
         "▫️ Отправь название или исполнителя — найду треки в YouTube/SoundCloud.\n"
         "▫️ Отправь YouTube-ссылку — предложу MP3 или MP4.\n"
-        "▫️ Отправь TikTok / Instagram / Pinterest — попробую скачать видео.\n\n"
+        "▫️ Отправь TikTok / Instagram / Pinterest — сразу скачаю видео.\n\n"
         "Лимиты:\n"
         f"▫️ Размер файла: до {MAX_FILE_SIZE // 1024 // 1024} МБ\n"
         f"▫️ Длительность: до {MAX_DURATION_SECONDS // 60} мин\n"
@@ -470,6 +523,7 @@ async def start(message: Message):
 
 @dp.message(F.text)
 async def handle_message(message: Message):
+    """Обработчик текстовых сообщений"""
     text = message.text.strip()
 
     if not text:
@@ -477,19 +531,17 @@ async def handle_message(message: Message):
 
     if is_url(text):
         chat_id = message.chat.id
-        pending_urls[chat_id] = text
 
         if is_youtube_url(text):
+            pending_urls[chat_id] = text
+
             return await message.answer(
                 "Выбери формат для YouTube:",
                 reply_markup=build_youtube_format_keyboard(),
             )
 
         if is_video_platform_url(text):
-            return await message.answer(
-                "Что скачать по этой ссылке?",
-                reply_markup=build_media_action_keyboard(),
-            )
+            return await run_download_job(message, text, "video")
 
         return await run_download_job(message, text, "audio")
 
@@ -511,6 +563,7 @@ async def handle_message(message: Message):
 
 @dp.callback_query()
 async def handle_callback(callback: CallbackQuery):
+    """Обработчик callback-запросов"""
     if not callback.message:
         return await callback.answer("Ошибка сообщения.", show_alert=True)
 
@@ -524,12 +577,14 @@ async def handle_callback(callback: CallbackQuery):
 
     if data in {"yt_audio", "yt_video", "direct_audio", "direct_video"}:
         url = pending_urls.get(chat_id)
+
         if not url:
             return await callback.answer("Ссылка устарела. Отправь её заново.", show_alert=True)
 
         mode = "audio" if data.endswith("_audio") else "video"
 
         await callback.answer()
+
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -573,16 +628,19 @@ async def handle_callback(callback: CallbackQuery):
             f"🎶 Результаты поиска, страница {page + 1}:",
             reply_markup=build_page_keyboard(tracks, page),
         )
+
         return await callback.answer()
 
     return await callback.answer("Неизвестная команда.", show_alert=True)
 
 
 async def health(request):
+    """Health check endpoint"""
     return web.Response(text="OK")
 
 
 async def main():
+    """Главная функция запуска бота"""
     cleanup_old_tmp_dirs()
     asyncio.create_task(periodic_cleanup())
 

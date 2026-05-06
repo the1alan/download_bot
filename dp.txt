@@ -21,7 +21,6 @@ from aiogram.types import (
 from dotenv import load_dotenv
 import yt_dlp
 
-
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -52,6 +51,7 @@ current_page: dict[int, int] = {}
 pending_urls: dict[int, str] = {}
 
 
+# ---------- Проверки ссылок ----------
 def is_url(text: str) -> bool:
     return bool(re.match(r"^https?://\S+$", text.strip(), re.IGNORECASE))
 
@@ -69,21 +69,20 @@ def is_youtube_url(url: str) -> bool:
     return any(host == h or host.endswith("." + h) for h in youtube_hosts)
 
 
-def is_video_platform_url(url: str) -> bool:
+def is_short_video_platform_url(url: str) -> bool:
+    """TikTok, Instagram, Pinterest — сразу скачиваем видео."""
     host = get_url_host(url)
-    video_hosts = (
-        "youtube.com",
-        "youtu.be",
-        "music.youtube.com",
+    short_video_hosts = (
         "tiktok.com",
         "instagram.com",
         "instagr.am",
         "pinterest.com",
         "pin.it",
     )
-    return any(host == h or host.endswith("." + h) for h in video_hosts)
+    return any(host == h or host.endswith("." + h) for h in short_video_hosts)
 
 
+# ---------- Утилиты ----------
 def safe_title(title: str | None, fallback: str = "media") -> str:
     if not title:
         return fallback
@@ -99,9 +98,7 @@ def create_job_dir(chat_id: int) -> Path:
 def cleanup_path(path: Path | str | None) -> None:
     if not path:
         return
-
     path = Path(path)
-
     try:
         if path.is_file():
             path.unlink(missing_ok=True)
@@ -114,7 +111,6 @@ def cleanup_path(path: Path | str | None) -> None:
 def cleanup_old_tmp_dirs() -> None:
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
     now = time.time()
-
     for item in TMP_ROOT.iterdir():
         try:
             if now - item.stat().st_mtime > TMP_TTL_SECONDS:
@@ -135,20 +131,18 @@ def get_largest_media_file(workdir: Path) -> Path | None:
         ".mp4", ".mov", ".mkv", ".webm",
         ".jpg", ".jpeg", ".png", ".webp",
     }
-
     files = [
         p for p in workdir.rglob("*")
         if p.is_file()
         and p.suffix.lower() in allowed_ext
         and not p.name.endswith(".part")
     ]
-
     if not files:
         return None
-
     return max(files, key=lambda p: p.stat().st_size)
 
 
+# ---------- Клавиатуры ----------
 def build_page_keyboard(tracks: list[dict], page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
     total_pages = max(1, -(-len(tracks) // per_page))
     start = page * per_page
@@ -177,6 +171,7 @@ def build_page_keyboard(tracks: list[dict], page: int = 0, per_page: int = 10) -
 
 
 def build_youtube_format_keyboard() -> InlineKeyboardMarkup:
+    """Только для YouTube — MP3 или MP4."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -190,39 +185,7 @@ def build_youtube_format_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def build_media_action_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🎬 Скачать видео", callback_data="direct_video"),
-            ],
-            [
-                InlineKeyboardButton(text="🎵 Попробовать как аудио", callback_data="direct_audio"),
-            ],
-            [
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel"),
-            ],
-        ]
-    )
-
-
-async def check_file_or_report(path: Path, status) -> bool:
-    try:
-        size = path.stat().st_size
-    except OSError:
-        await status.edit_text("❌ Файл недоступен.")
-        return False
-
-    if size > MAX_FILE_SIZE:
-        await status.edit_text(
-            f"⚠️ Файл слишком большой: {size / 1024 / 1024:.1f} МБ.\n"
-            f"Лимит: {MAX_FILE_SIZE / 1024 / 1024:.0f} МБ."
-        )
-        return False
-
-    return True
-
-
+# ---------- yt-dlp опции ----------
 SEARCH_OPTS = {
     "quiet": True,
     "extract_flat": True,
@@ -239,10 +202,10 @@ def ytdlp_base_opts() -> dict:
     }
 
 
+# ---------- Поиск ----------
 async def search_all(query: str, limit: int = 10) -> list[dict]:
     def _search() -> list[dict]:
         results = []
-
         with yt_dlp.YoutubeDL(SEARCH_OPTS) as ydl:
             try:
                 yt_info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
@@ -272,18 +235,15 @@ async def search_all(query: str, limit: int = 10) -> list[dict]:
             if item["url"] not in seen:
                 seen.add(item["url"])
                 unique.append(item)
-
         return unique
 
     return await asyncio.to_thread(_search)
 
 
+# ---------- Метаданные и загрузка ----------
 def extract_metadata(url: str) -> dict | None:
     opts = ytdlp_base_opts()
-    opts.update({
-        "skip_download": True,
-    })
-
+    opts.update({"skip_download": True})
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -291,7 +251,6 @@ def extract_metadata(url: str) -> dict | None:
 def validate_metadata(info: dict | None) -> tuple[bool, str]:
     if not info:
         return False, "❌ Не удалось получить информацию о файле."
-
     duration = info.get("duration")
     if duration and duration > MAX_DURATION_SECONDS:
         return (
@@ -299,7 +258,6 @@ def validate_metadata(info: dict | None) -> tuple[bool, str]:
             f"⚠️ Слишком длинное медиа: {duration // 60} мин.\n"
             f"Лимит: {MAX_DURATION_SECONDS // 60} мин."
         )
-
     return True, ""
 
 
@@ -321,15 +279,12 @@ async def download_audio(url: str, chat_id: int) -> tuple[Path | None, str | Non
         opts.update({
             "format": "bestaudio/best",
             "outtmpl": str(workdir / "%(title).120s_%(id)s.%(ext)s"),
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
         })
-
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
 
@@ -364,7 +319,6 @@ async def download_video(url: str, chat_id: int) -> tuple[Path | None, str | Non
             "outtmpl": str(workdir / "%(title).120s_%(id)s.%(ext)s"),
             "merge_output_format": "mp4",
         })
-
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
 
@@ -374,22 +328,35 @@ async def download_video(url: str, chat_id: int) -> tuple[Path | None, str | Non
     return await asyncio.to_thread(_download)
 
 
+# ---------- Отправка файлов ----------
+async def check_file_or_report(path: Path, status) -> bool:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        await status.edit_text("❌ Файл недоступен.")
+        return False
+    if size > MAX_FILE_SIZE:
+        await status.edit_text(
+            f"⚠️ Файл слишком большой: {size / 1024 / 1024:.1f} МБ.\n"
+            f"Лимит: {MAX_FILE_SIZE / 1024 / 1024:.0f} МБ."
+        )
+        return False
+    return True
+
+
 async def send_audio_and_clean(chat_id: int, path: Path, status, title: str | None, workdir: Path | None):
     try:
         if not await check_file_or_report(path, status):
             return
-
         await bot.send_audio(
             chat_id=chat_id,
             audio=FSInputFile(path),
             title=title or "Аудио",
         )
         await status.delete()
-
     except Exception as e:
         logging.exception("Ошибка отправки аудио")
         await status.edit_text(f"❌ Ошибка отправки аудио: {e}")
-
     finally:
         cleanup_path(workdir or path.parent)
 
@@ -398,7 +365,6 @@ async def send_video_and_clean(chat_id: int, path: Path, status, title: str | No
     try:
         if not await check_file_or_report(path, status):
             return
-
         await bot.send_video(
             chat_id=chat_id,
             video=FSInputFile(path),
@@ -406,41 +372,33 @@ async def send_video_and_clean(chat_id: int, path: Path, status, title: str | No
             supports_streaming=True,
         )
         await status.delete()
-
     except Exception as e:
         logging.exception("Ошибка отправки видео")
         await status.edit_text(f"❌ Ошибка отправки видео: {e}")
-
     finally:
         cleanup_path(workdir or path.parent)
 
 
 async def run_download_job(message_or_callback_message: Message, url: str, mode: str):
     chat_id = message_or_callback_message.chat.id
-
     async with download_semaphore:
         if mode == "audio":
             status = await message_or_callback_message.answer("⏳ Скачиваю аудио...")
             path, title, workdir, error = await download_audio(url, chat_id)
-
             if error:
                 cleanup_path(workdir)
                 return await status.edit_text(error)
-
             if not path:
                 cleanup_path(workdir)
                 return await status.edit_text("❌ Не удалось скачать аудио.")
-
             return await send_audio_and_clean(chat_id, path, status, title, workdir)
 
         if mode == "video":
             status = await message_or_callback_message.answer("⏳ Скачиваю видео...")
             path, title, workdir, error = await download_video(url, chat_id)
-
             if error:
                 cleanup_path(workdir)
                 return await status.edit_text(error)
-
             if not path:
                 cleanup_path(workdir)
                 return await status.edit_text(
@@ -448,19 +406,19 @@ async def run_download_job(message_or_callback_message: Message, url: str, mode:
                     "Возможные причины: приватный контент, ограничение платформы, "
                     "нужна авторизация или ссылка не поддерживается."
                 )
-
             return await send_video_and_clean(chat_id, path, status, title, workdir)
 
         return await message_or_callback_message.answer("❌ Неизвестный режим скачивания.")
 
 
+# ---------- Хендлеры ----------
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
         "🎵 Привет. Я скачиваю аудио и видео.\n\n"
         "▫️ Отправь название или исполнителя — найду треки в YouTube/SoundCloud.\n"
         "▫️ Отправь YouTube-ссылку — предложу MP3 или MP4.\n"
-        "▫️ Отправь TikTok / Instagram / Pinterest — попробую скачать видео.\n\n"
+        "▫️ Отправь TikTok / Instagram / Pinterest — сразу скачаю видео.\n\n"
         "Лимиты:\n"
         f"▫️ Размер файла: до {MAX_FILE_SIZE // 1024 // 1024} МБ\n"
         f"▫️ Длительность: до {MAX_DURATION_SECONDS // 60} мин\n"
@@ -471,7 +429,6 @@ async def start(message: Message):
 @dp.message(F.text)
 async def handle_message(message: Message):
     text = message.text.strip()
-
     if not text:
         return await message.answer("Введи название трека или ссылку.")
 
@@ -479,30 +436,27 @@ async def handle_message(message: Message):
         chat_id = message.chat.id
         pending_urls[chat_id] = text
 
+        # Только YouTube спрашивает формат
         if is_youtube_url(text):
             return await message.answer(
                 "Выбери формат для YouTube:",
                 reply_markup=build_youtube_format_keyboard(),
             )
 
-        if is_video_platform_url(text):
-            return await message.answer(
-                "Что скачать по этой ссылке?",
-                reply_markup=build_media_action_keyboard(),
-            )
+        # TikTok / Instagram / Pinterest — сразу видео
+        if is_short_video_platform_url(text):
+            return await run_download_job(message, text, "video")
 
+        # Остальные прямые ссылки (SoundCloud и т.п.) — пробуем аудио
         return await run_download_job(message, text, "audio")
 
+    # Поиск по текстовому запросу
     await message.answer(f"🔍 Ищу: {text}...")
-
     tracks = await search_all(text, limit=10)
-
     if not tracks:
         return await message.answer("😔 Ничего не найдено.")
-
     search_results[message.chat.id] = tracks
     current_page[message.chat.id] = 0
-
     await message.answer(
         "🎶 Результаты поиска:",
         reply_markup=build_page_keyboard(tracks, 0),
@@ -522,53 +476,44 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.edit_text("Отменено.")
         return await callback.answer()
 
-    if data in {"yt_audio", "yt_video", "direct_audio", "direct_video"}:
+    # Форматы выбора для YouTube
+    if data in {"yt_audio", "yt_video"}:
         url = pending_urls.get(chat_id)
         if not url:
             return await callback.answer("Ссылка устарела. Отправь её заново.", show_alert=True)
-
         mode = "audio" if data.endswith("_audio") else "video"
-
         await callback.answer()
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-
         return await run_download_job(callback.message, url, mode)
 
+    # Выбор из результатов поиска (всегда аудио)
     if data.startswith("dl_"):
         tracks = search_results.get(chat_id)
-
         if not tracks:
             return await callback.answer("Результаты устарели.", show_alert=True)
-
         try:
             idx = int(data[3:])
         except ValueError:
             return await callback.answer("Ошибка.", show_alert=True)
-
         if idx < 0 or idx >= len(tracks):
             return await callback.answer("Трек не найден.", show_alert=True)
-
         url = tracks[idx]["url"]
-
         await callback.answer()
         return await run_download_job(callback.message, url, "audio")
 
+    # Пагинация
     if data.startswith("page_"):
         tracks = search_results.get(chat_id)
-
         if not tracks:
             return await callback.answer("Результаты устарели.", show_alert=True)
-
         try:
             page = int(data[5:])
         except ValueError:
             return await callback.answer("Неверная страница.", show_alert=True)
-
         current_page[chat_id] = page
-
         await callback.message.edit_text(
             f"🎶 Результаты поиска, страница {page + 1}:",
             reply_markup=build_page_keyboard(tracks, page),
@@ -578,6 +523,7 @@ async def handle_callback(callback: CallbackQuery):
     return await callback.answer("Неизвестная команда.", show_alert=True)
 
 
+# ---------- Health-сервер ----------
 async def health(request):
     return web.Response(text="OK")
 
@@ -588,16 +534,13 @@ async def main():
 
     app = web.Application()
     app.router.add_get("/", health)
-
     runner = web.AppRunner(app)
     await runner.setup()
-
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
     logging.info("Health server started on port %s", PORT)
     logging.info("Bot polling started")
-
     await dp.start_polling(bot)
 
 

@@ -1,0 +1,476 @@
+import asyncio
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from dotenv import load_dotenv
+import yt_dlp
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден в .env")
+
+MAX_FILE_SIZE = 49 * 1024 * 1024
+DOWNLOADS_DIR = Path("downloads")
+DOWNLOADS_DIR.mkdir(exist_ok=True)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+download_semaphore = asyncio.Semaphore(3)
+user_search_results: dict[int, list[dict]] = {}
+user_search_page: dict[int, int] = {}
+pending_youtube_urls: dict[int, str] = {}
+
+
+def get_domain(url: str) -> str:
+    """Извлекает домен из URL"""
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().replace("www.", "")
+        return domain
+    except Exception:
+        return ""
+
+
+def is_youtube(url: str) -> bool:
+    """Проверяет, является ли URL ссылкой на YouTube"""
+    domain = get_domain(url)
+    return any(x in domain for x in ["youtube.com", "youtu.be", "music.youtube.com"])
+
+
+def is_supported_platform(url: str) -> bool:
+    """Проверяет, поддерживается ли платформа"""
+    domain = get_domain(url)
+    supported = [
+        "youtube.com", "youtu.be", "tiktok.com", "instagram.com",
+        "vk.com", "pinterest.com", "pin.it", "soundcloud.com"
+    ]
+    return any(x in domain for x in supported)
+
+
+def get_user_dir(user_id: int) -> Path:
+    """Создает и возвращает директорию пользователя"""
+    user_dir = DOWNLOADS_DIR / str(user_id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    return user_dir
+
+
+def cleanup_user_dir(user_id: int) -> None:
+    """Удаляет все файлы пользователя"""
+    user_dir = get_user_dir(user_id)
+    try:
+        for file in user_dir.iterdir():
+            if file.is_file():
+                file.unlink()
+    except Exception as e:
+        logger.warning(f"Ошибка очистки директории {user_id}: {e}")
+
+
+def safe_filename(text: str) -> str:
+    """Очищает имя файла от недопустимых символов"""
+    text = re.sub(r'[<>:"/\\|?*]', "", text)
+    return text[:100]
+
+
+async def search_youtube(query: str) -> list[dict]:
+    """Ищет видео на YouTube"""
+    def _search():
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "skip_download": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                result = ydl.extract_info(f"ytsearch30:{query}", download=False)
+                entries = result.get("entries", [])
+                videos = []
+                for entry in entries:
+                    if entry:
+                        videos.append({
+                            "title": entry.get("title", "Без названия"),
+                            "url": entry.get("url", ""),
+                            "duration": entry.get("duration", 0),
+                        })
+                return videos
+        except Exception as e:
+            logger.error(f"Ошибка поиска: {e}")
+            return []
+    
+    return await asyncio.to_thread(_search)
+
+
+async def download_audio(url: str, user_id: int) -> Optional[Path]:
+    """Скачивает аудио"""
+    def _download():
+        user_dir = get_user_dir(user_id)
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": str(user_dir / "%(title)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                audio_file = Path(filename).with_suffix(".mp3")
+                if audio_file.exists() and audio_file.stat().st_size <= MAX_FILE_SIZE:
+                    return audio_file
+                return None
+        except Exception as e:
+            logger.error(f"Ошибка скачивания аудио: {e}")
+            return None
+    
+    return await asyncio.to_thread(_download)
+
+
+async def download_video(url: str, user_id: int) -> Optional[Path]:
+    """Скачивает видео"""
+    def _download():
+        user_dir = get_user_dir(user_id)
+        ydl_opts = {
+            "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            "outtmpl": str(user_dir / "%(title)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "merge_output_format": "mp4",
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                video_file = Path(filename)
+                if video_file.exists() and video_file.stat().st_size <= MAX_FILE_SIZE:
+                    return video_file
+                return None
+        except Exception as e:
+            logger.error(f"Ошибка скачивания видео: {e}")
+            return None
+    
+    return await asyncio.to_thread(_download)
+
+
+async def download_generic(url: str, user_id: int) -> Optional[tuple[Path, str]]:
+    """Скачивает контент с любой платформы"""
+    def _download():
+        user_dir = get_user_dir(user_id)
+        ydl_opts = {
+            "format": "best",
+            "outtmpl": str(user_dir / "%(title)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                file_path = Path(filename)
+                if file_path.exists() and file_path.stat().st_size <= MAX_FILE_SIZE:
+                    ext = file_path.suffix.lower()
+                    return file_path, ext
+                return None, None
+        except Exception as e:
+            logger.error(f"Ошибка скачивания: {e}")
+            return None, None
+    
+    return await asyncio.to_thread(_download)
+
+
+def build_search_keyboard(results: list[dict], page: int = 0) -> InlineKeyboardMarkup:
+    """Создает клавиатуру с результатами поиска"""
+    per_page = 10
+    start = page * per_page
+    end = start + per_page
+    page_results = results[start:end]
+    
+    buttons = []
+    for i, result in enumerate(page_results, start=start):
+        duration = result.get("duration", 0)
+        duration_str = f" ({duration // 60}:{duration % 60:02d})" if duration else ""
+        title = result["title"][:40]
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{i + 1}. {title}{duration_str}",
+                callback_data=f"track_{i}"
+            )
+        ])
+    
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page_{page - 1}"))
+    if end < len(results):
+        nav.append(InlineKeyboardButton(text="➡️ Далее", callback_data=f"page_{page + 1}"))
+    
+    if nav:
+        buttons.append(nav)
+    
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def build_youtube_keyboard() -> InlineKeyboardMarkup:
+    """Создает клавиатуру выбора формата для YouTube"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎵 MP3", callback_data="yt_mp3"),
+            InlineKeyboardButton(text="🎬 MP4", callback_data="yt_mp4"),
+        ],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    """Обработчик команды /start"""
+    await message.answer(
+        "Привет! Отправь ссылку на YouTube, TikTok, Instagram, VK, Pinterest, SoundCloud "
+        "или введи название песни в формате:\n\n"
+        "<b>Исполнитель - Название</b>\n\n"
+        "Например: <code>Miyagi - Captain</code>",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    """Обработчик команды /help"""
+    await message.answer(
+        "<b>Как пользоваться ботом:</b>\n\n"
+        "• Отправь ссылку на видео/аудио\n"
+        "• Или введи название трека для поиска\n\n"
+        "<b>Поддерживаемые платформы:</b>\n"
+        "YouTube, TikTok, Instagram, VK, Pinterest, SoundCloud\n\n"
+        "<b>Важно:</b>\n"
+        "• YouTube: выбери MP3 или MP4\n"
+        "• Остальные платформы скачиваются автоматически\n"
+        "• Бот работает только с публичным разрешённым контентом\n"
+        "• Максимальный размер файла: 49 МБ",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(F.text)
+async def handle_text(message: Message):
+    """Обработчик текстовых сообщений"""
+    text = message.text.strip()
+    user_id = message.from_user.id
+    
+    # Проверяем, является ли текст URL
+    if text.startswith("http://") or text.startswith("https://"):
+        if not is_supported_platform(text):
+            await message.answer("Эта платформа пока не поддерживается.")
+            return
+        
+        if is_youtube(text):
+            pending_youtube_urls[user_id] = text
+            await message.answer(
+                "Выбери формат для скачивания:",
+                reply_markup=build_youtube_keyboard()
+            )
+        else:
+            await message.answer("⏳ Скачиваю...")
+            async with download_semaphore:
+                cleanup_user_dir(user_id)
+                file_path, ext = await download_generic(text, user_id)
+                
+                if not file_path:
+                    await message.answer(
+                        "Не удалось скачать. Возможно, контент приватный, удалён или временно недоступен."
+                    )
+                    return
+                
+                try:
+                    if ext in [".mp4", ".mov", ".avi", ".mkv"]:
+                        await message.answer_video(FSInputFile(file_path))
+                    elif ext in [".mp3", ".m4a", ".ogg", ".wav"]:
+                        await message.answer_audio(FSInputFile(file_path))
+                    elif ext in [".jpg", ".jpeg", ".png", ".webp"]:
+                        await message.answer_photo(FSInputFile(file_path))
+                    else:
+                        await message.answer_document(FSInputFile(file_path))
+                except Exception as e:
+                    logger.error(f"Ошибка отправки файла: {e}")
+                    await message.answer("Не удалось отправить файл.")
+                finally:
+                    cleanup_user_dir(user_id)
+    else:
+        # Поиск по тексту
+        await message.answer("🔍 Ищу...")
+        results = await search_youtube(text)
+        
+        if not results:
+            await message.answer("Ничего не найдено. Попробуй другой запрос.")
+            return
+        
+        user_search_results[user_id] = results
+        user_search_page[user_id] = 0
+        
+        await message.answer(
+            f"Найдено результатов: {len(results)}\nВыбери трек:",
+            reply_markup=build_search_keyboard(results, 0)
+        )
+
+
+@dp.callback_query(F.data == "cancel")
+async def callback_cancel(callback: CallbackQuery):
+    """Обработчик отмены"""
+    user_id = callback.from_user.id
+    pending_youtube_urls.pop(user_id, None)
+    user_search_results.pop(user_id, None)
+    user_search_page.pop(user_id, None)
+    
+    await callback.message.edit_text("Отменено.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("yt_"))
+async def callback_youtube_format(callback: CallbackQuery):
+    """Обработчик выбора формата для YouTube"""
+    user_id = callback.from_user.id
+    url = pending_youtube_urls.get(user_id)
+    
+    if not url:
+        await callback.answer("Ссылка устарела. Отправь её заново.", show_alert=True)
+        return
+    
+    format_type = callback.data.split("_")[1]
+    await callback.message.edit_text("⏳ Скачиваю...")
+    
+    async with download_semaphore:
+        cleanup_user_dir(user_id)
+        
+        if format_type == "mp3":
+            file_path = await download_audio(url, user_id)
+            if file_path:
+                try:
+                    await callback.message.answer_audio(FSInputFile(file_path))
+                except Exception as e:
+                    logger.error(f"Ошибка отправки аудио: {e}")
+                    await callback.message.answer("Не удалось отправить файл.")
+            else:
+                await callback.message.answer(
+                    "Не удалось скачать аудио или файл слишком большой (макс. 49 МБ)."
+                )
+        else:
+            file_path = await download_video(url, user_id)
+            if file_path:
+                try:
+                    await callback.message.answer_video(FSInputFile(file_path))
+                except Exception:
+                    try:
+                        await callback.message.answer_document(FSInputFile(file_path))
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки видео: {e}")
+                        await callback.message.answer("Не удалось отправить файл.")
+            else:
+                await callback.message.answer(
+                    "Не удалось скачать видео или файл слишком большой (макс. 49 МБ)."
+                )
+        
+        cleanup_user_dir(user_id)
+    
+    pending_youtube_urls.pop(user_id, None)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("page_"))
+async def callback_page(callback: CallbackQuery):
+    """Обработчик пагинации"""
+    user_id = callback.from_user.id
+    results = user_search_results.get(user_id)
+    
+    if not results:
+        await callback.answer("Результаты устарели. Выполни поиск заново.", show_alert=True)
+        return
+    
+    page = int(callback.data.split("_")[1])
+    user_search_page[user_id] = page
+    
+    await callback.message.edit_text(
+        f"Найдено результатов: {len(results)}\nВыбери трек:",
+        reply_markup=build_search_keyboard(results, page)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("track_"))
+async def callback_track(callback: CallbackQuery):
+    """Обработчик выбора трека"""
+    user_id = callback.from_user.id
+    results = user_search_results.get(user_id)
+    
+    if not results:
+        await callback.answer("Результаты устарели. Выполни поиск заново.", show_alert=True)
+        return
+    
+    track_index = int(callback.data.split("_")[1])
+    
+    if track_index >= len(results):
+        await callback.answer("Трек не найден.", show_alert=True)
+        return
+    
+    track = results[track_index]
+    url = track["url"]
+    
+    await callback.message.edit_text("⏳ Скачиваю...")
+    
+    async with download_semaphore:
+        cleanup_user_dir(user_id)
+        file_path = await download_audio(url, user_id)
+        
+        if file_path:
+            try:
+                await callback.message.answer_audio(FSInputFile(file_path))
+            except Exception as e:
+                logger.error(f"Ошибка отправки аудио: {e}")
+                await callback.message.answer("Не удалось отправить файл.")
+        else:
+            await callback.message.answer(
+                "Не удалось скачать аудио или файл слишком большой (макс. 49 МБ)."
+            )
+        
+        cleanup_user_dir(user_id)
+    
+    await callback.answer()
+
+
+async def main():
+    """Запуск бота"""
+    logger.info("Бот запущен")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

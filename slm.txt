@@ -1,0 +1,413 @@
+"""Telegram бот для скачивания аудио и видео."""
+
+import asyncio
+import logging
+import os
+import re
+import shutil
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+import yt_dlp
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Конфигурация
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан")
+
+PORT = int(os.getenv("PORT", "10000"))
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "45")) * 1024 * 1024
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
+MAX_DURATION = int(os.getenv("MAX_DURATION_SECONDS", "1200"))
+TMP_ROOT = Path(os.getenv("TMP_ROOT", "tmp_downloads"))
+TMP_TTL = int(os.getenv("TMP_TTL_SECONDS", "3600"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+# Хранилище сессий
+sessions = {"search": {}, "page": {}, "url": {}}
+
+
+# ==================== Утилиты ====================
+
+def is_url(text: str) -> bool:
+    return bool(re.match(r"^https?://\S+$", text.strip(), re.IGNORECASE))
+
+
+def get_host(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower().replace("www.", "")
+    except Exception as e:
+        logging.warning(f"Failed to parse URL {url}: {e}")
+        return ""
+
+
+def is_youtube(url: str) -> bool:
+    host = get_host(url)
+    youtube_hosts = ("youtube.com", "youtu.be", "music.youtube.com")
+    return any(host == h or host.endswith(f".{h}") for h in youtube_hosts)
+
+
+def is_video_platform(url: str) -> bool:
+    host = get_host(url)
+    video_hosts = (
+        "youtube.com", "youtu.be", "music.youtube.com",
+        "tiktok.com", "instagram.com", "instagr.am",
+        "pinterest.com", "pin.it"
+    )
+    return any(host == h or host.endswith(f".{h}") for h in video_hosts)
+
+
+def safe_title(title: str | None) -> str:
+    if not title:
+        return "media"
+    return re.sub(r'[\\/:*?"<>|]+', "_", title)[:120].strip() or "media"
+
+
+def cleanup(path: Path | str | None) -> None:
+    if not path:
+        return
+    path = Path(path)
+    try:
+        if path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception as e:
+        logging.warning(f"Cleanup error {path}: {e}")
+
+
+def get_largest_file(workdir: Path) -> Path | None:
+    exts = {".mp3", ".m4a", ".opus", ".mp4", ".mov", ".mkv", ".webm"}
+    files = [p for p in workdir.rglob("*") if p.is_file() and p.suffix.lower() in exts and not p.name.endswith(".part")]
+    return max(files, key=lambda p: p.stat().st_size) if files else None
+
+
+def cleanup_old() -> None:
+    TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for item in TMP_ROOT.iterdir():
+        try:
+            if now - item.stat().st_mtime > TMP_TTL:
+                cleanup(item)
+        except Exception as e:
+            logging.warning(f"Failed to cleanup {item}: {e}")
+
+
+async def periodic_cleanup():
+    while True:
+        await asyncio.to_thread(cleanup_old)
+        await asyncio.sleep(900)
+
+
+# ==================== Клавиатуры ====================
+
+def kb_search(results: list, page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
+    total = max(1, -(-len(results) // per_page))
+    start, end = page * per_page, (page + 1) * per_page
+    
+    buttons = [[InlineKeyboardButton(text=f"{i+1}. {r['title'][:50]}", callback_data=f"dl_{i}")] 
+               for i, r in enumerate(results[start:end], start)]
+    
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"page_{page-1}"))
+    if page < total - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"page_{page+1}"))
+    if nav:
+        buttons.append(nav)
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def kb_youtube() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎵 MP3", callback_data="yt_audio"),
+         InlineKeyboardButton(text="🎬 MP4", callback_data="yt_video")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
+    ])
+
+
+def kb_media() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Видео", callback_data="direct_video")],
+        [InlineKeyboardButton(text="🎵 Аудио", callback_data="direct_audio")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
+    ])
+
+
+# ==================== Загрузка ====================
+
+async def search(query: str, limit: int = 10) -> list[dict]:
+    def _search():
+        results = []
+        opts = {"quiet": True, "extract_flat": True, "noplaylist": True}
+        
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            # YouTube
+            try:
+                info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+                for e in info.get("entries", []) or []:
+                    if e and e.get("id") and e.get("title"):
+                        results.append({"title": f"[YT] {e['title']}", "url": f"https://www.youtube.com/watch?v={e['id']}"})
+            except Exception as e:
+                logging.warning(f"YT search error: {e}")
+            
+            # SoundCloud
+            try:
+                info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
+                for e in info.get("entries", []) or []:
+                    if e and e.get("url") and e.get("title"):
+                        results.append({"title": f"[SC] {e['title']}", "url": e["url"]})
+            except Exception as e:
+                logging.warning(f"SC search error: {e}")
+        
+        # Удаление дубликатов
+        seen, unique = set(), []
+        for r in results:
+            if r["url"] not in seen:
+                seen.add(r["url"])
+                unique.append(r)
+        return unique
+    
+    return await asyncio.to_thread(_search)
+
+
+def validate(info: dict | None) -> tuple[bool, str]:
+    if not info:
+        return False, "❌ Не удалось получить информацию"
+    duration = info.get("duration")
+    if duration and duration > MAX_DURATION:
+        return False, f"⚠️ Слишком длинное: {duration//60} мин (лимит: {MAX_DURATION//60} мин)"
+    return True, ""
+
+
+async def download(url: str, chat_id: int, mode: str) -> tuple[Path | None, str | None, Path | None, str | None]:
+    def _download():
+        workdir = Path(tempfile.mkdtemp(prefix=f"job_{chat_id}_", dir=TMP_ROOT))
+        
+        try:
+            opts = {"quiet": True, "no_warnings": False, "ignoreerrors": True, "noplaylist": True, "skip_download": True}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            
+            ok, error = validate(info)
+            if not ok:
+                return None, None, workdir, error
+            
+            title = safe_title(info.get("title") if info else None)
+            
+            opts = {"quiet": True, "no_warnings": False, "ignoreerrors": True, "noplaylist": True,
+                    "outtmpl": str(workdir / "%(title).120s_%(id)s.%(ext)s")}
+            
+            if mode == "audio":
+                opts.update({"format": "bestaudio/best", 
+                           "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]})
+            else:
+                opts.update({"format": "bestvideo[ext=mp4][height<=720][filesize<45M]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best",
+                           "merge_output_format": "mp4"})
+            
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+            
+            path = get_largest_file(workdir)
+            return path, title, workdir, None
+        
+        except Exception as e:
+            logging.exception(f"Download error")
+            return None, None, workdir, f"Ошибка: {e}"
+    
+    return await asyncio.to_thread(_download)
+
+
+async def send_file(chat_id: int, path: Path, status: Message, title: str, workdir: Path, mode: str):
+    try:
+        size = path.stat().st_size
+        if size > MAX_FILE_SIZE:
+            await status.edit_text(f"⚠️ Файл слишком большой: {size/1024/1024:.1f} МБ (лимит: {MAX_FILE_SIZE/1024/1024:.0f} МБ)")
+            return
+        
+        if mode == "audio":
+            await bot.send_audio(chat_id, FSInputFile(path), title=title)
+        else:
+            await bot.send_video(chat_id, FSInputFile(path), caption=title[:1024], supports_streaming=True)
+        
+        await status.delete()
+    
+    except Exception as e:
+        logging.exception("Send error")
+        await status.edit_text(f"❌ Ошибка отправки: {e}")
+    
+    finally:
+        cleanup(workdir)
+
+
+async def run_job(message: Message, url: str, mode: str):
+    chat_id = message.chat.id
+    
+    async with semaphore:
+        status = await message.answer(f"⏳ Скачиваю {'аудио' if mode == 'audio' else 'видео'}...")
+        path, title, workdir, error = await download(url, chat_id, mode)
+        
+        if error:
+            cleanup(workdir)
+            return await status.edit_text(error)
+        
+        if not path:
+            cleanup(workdir)
+            return await status.edit_text(f"❌ Не удалось скачать {'аудио' if mode == 'audio' else 'видео'}")
+        
+        await send_file(chat_id, path, status, title, workdir, mode)
+
+
+# ==================== Обработчики ====================
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    await message.answer(
+        "  Привет. Я скачиваю аудио и видео.\n\n"
+        "▫️ Отправь название или исполнителя — найду треки в YouTube/SoundCloud.\n"
+        "▫️ Отправь YouTube-ссылку — предложу MP3 или MP4.\n"
+        "▫️ Отправь TikTok / Instagram / Pinterest — попробую скачать видео.\n\n"
+        "Лимиты:\n"
+        f"▫️ Размер файла: до {MAX_FILE_SIZE // 1024 // 1024} МБ\n"
+        f"▫️ Длительность: до {MAX_DURATION // 60} мин\n"
+        f"▫️ Одновременно загрузок: {MAX_CONCURRENT}"
+    )
+
+
+@dp.message(F.text)
+async def handle_text(message: Message):
+    text = message.text.strip()
+    if not text:
+        return await message.answer("Введи название или ссылку")
+    
+    chat_id = message.chat.id
+    
+    if is_url(text):
+        sessions["url"][chat_id] = text
+        
+        if is_youtube(text):
+            return await message.answer("Выбери формат:", reply_markup=kb_youtube())
+        if is_video_platform(text):
+            return await message.answer("Что скачать?", reply_markup=kb_media())
+        
+        return await run_job(message, text, "audio")
+    
+    status = await message.answer(f"🔍 Ищу: <b>{text}</b>...", parse_mode="HTML")
+    results = await search(text, 10)
+    
+    if not results:
+        return await status.edit_text("😔 Ничего не найдено")
+    
+    sessions["search"][chat_id] = results
+    sessions["page"][chat_id] = 0
+    
+    await status.edit_text(f"🎶 Найдено <b>{len(results)}</b>:", reply_markup=kb_search(results), parse_mode="HTML")
+
+
+@dp.callback_query()
+async def handle_callback(callback: CallbackQuery):
+    if not callback.message:
+        return await callback.answer("Ошибка", show_alert=True)
+    
+    chat_id = callback.message.chat.id
+    data = callback.data or ""
+    
+    if data == "cancel":
+        sessions["url"].pop(chat_id, None)
+        await callback.message.edit_text("❌ Отменено")
+        return await callback.answer()
+    
+    if data in {"yt_audio", "yt_video", "direct_audio", "direct_video"}:
+        url = sessions["url"].pop(chat_id, None)
+        if not url:
+            return await callback.answer("⚠️ Ссылка устарела", show_alert=True)
+        
+        mode = "audio" if data.endswith("_audio") else "video"
+        await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception as e:
+            logging.warning(f"Failed to remove keyboard: {e}")
+        return await run_job(callback.message, url, mode)
+    
+    if data.startswith("dl_"):
+        results = sessions["search"].get(chat_id)
+        if not results:
+            return await callback.answer("⚠️ Результаты устарели", show_alert=True)
+        
+        try:
+            idx = int(data[3:])
+        except ValueError:
+            return await callback.answer("❌ Ошибка", show_alert=True)
+        
+        if 0 <= idx < len(results):
+            await callback.answer()
+            return await run_job(callback.message, results[idx]["url"], "audio")
+    
+    if data.startswith("page_"):
+        results = sessions["search"].get(chat_id)
+        if not results:
+            return await callback.answer("⚠️ Результаты устарели", show_alert=True)
+        
+        try:
+            page = int(data[5:])
+            sessions["page"][chat_id] = page
+            await callback.message.edit_text(f"🎶 Страница {page+1}:", reply_markup=kb_search(results, page))
+            return await callback.answer()
+        except ValueError:
+            return await callback.answer("❌ Ошибка", show_alert=True)
+        except Exception as e:
+            logging.exception(f"Page navigation error: {e}")
+            return await callback.answer("❌ Ошибка", show_alert=True)
+    
+    return await callback.answer("❌ Неизвестная команда", show_alert=True)
+
+
+# ==================== Запуск ====================
+
+async def health(request):
+    return web.Response(text="OK")
+
+
+async def main():
+    cleanup_old()
+    asyncio.create_task(periodic_cleanup())
+    
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    
+    logging.info(f"🌐 Server on port {PORT}")
+    logging.info("🤖 Bot started")
+    
+    try:
+        await dp.start_polling(bot)
+    except KeyboardInterrupt:
+        logging.info("🛑 Bot stopped by user")
+    finally:
+        await bot.session.close()
+        await runner.cleanup()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("👋 Shutdown complete")
