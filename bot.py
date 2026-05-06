@@ -1,68 +1,55 @@
 import asyncio
-from aiohttp import web
-from dotenv import load_dotenv
+import logging
 import os
 import re
+import shutil
+import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-load_dotenv()
-
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import CommandStart
 from aiogram.types import (
-    Message,
     CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
     FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
 from dotenv import load_dotenv
 import yt_dlp
 
 
+load_dotenv()
+
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
+
 PORT = int(os.getenv("PORT", "10000"))
+
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "45")) * 1024 * 1024
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
+MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "1200"))
+
+TMP_ROOT = Path(os.getenv("TMP_ROOT", "tmp_downloads"))
+TMP_TTL_SECONDS = int(os.getenv("TMP_TTL_SECONDS", "3600"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-search_results = {}
-current_page = {}
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-DOWNLOAD_DIR = Path("downloads")
-MAX_FILE_SIZE = 45 * 1024 * 1024
-
-SEARCH_OPTS = {
-    "quiet": True,
-    "extract_flat": True,
-}
-
-AUDIO_DOWNLOAD_OPTS = {
-    "format": "bestaudio/best",
-    "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
-    "quiet": True,
-    "ignoreerrors": True,
-}
-
-VIDEO_DOWNLOAD_OPTS = {
-    # Стараемся взять mp4 до 45 МБ. Если точный размер неизвестен,
-    # yt-dlp всё равно может скачать файл больше лимита, поэтому ниже есть проверка размера.
-    "format": (
-        "bestvideo[ext=mp4][height<=720][filesize<45M]+bestaudio[ext=m4a]/"
-        "best[ext=mp4][height<=720][filesize<45M]/"
-        "best[ext=mp4][height<=720]/"
-        "best"
-    ),
-    "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
-    "quiet": True,
-    "ignoreerrors": True,
-    "merge_output_format": "mp4",
-    "noplaylist": True,
-}
+search_results: dict[int, list[dict]] = {}
+current_page: dict[int, int] = {}
+pending_urls: dict[int, str] = {}
 
 
 def is_url(text: str) -> bool:
@@ -97,95 +84,69 @@ def is_video_platform_url(url: str) -> bool:
     return any(host == h or host.endswith("." + h) for h in video_hosts)
 
 
-def find_downloaded_file(media_id: str) -> str | None:
-    for file_path in DOWNLOAD_DIR.glob(f"{media_id}.*"):
-        return str(file_path)
-    return None
+def safe_title(title: str | None, fallback: str = "media") -> str:
+    if not title:
+        return fallback
+    title = re.sub(r"[\\/:*?\"<>|]+", "_", title)
+    return title[:120].strip() or fallback
 
 
-async def search_all(query: str, limit: int = 10) -> list[dict]:
-    def _search():
-        results = []
-        with yt_dlp.YoutubeDL(SEARCH_OPTS) as ydl:
-            try:
-                yt_info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-                for entry in yt_info.get("entries", []) or []:
-                    if entry:
-                        results.append({
-                            "title": f"[YT] {entry['title']}",
-                            "url": f"https://www.youtube.com/watch?v={entry['id']}",
-                        })
-            except Exception:
-                pass
-
-            try:
-                sc_info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
-                for entry in sc_info.get("entries", []) or []:
-                    if entry:
-                        results.append({
-                            "title": f"[SC] {entry['title']}",
-                            "url": entry["url"],
-                        })
-            except Exception:
-                pass
-
-        seen = set()
-        unique = []
-        for r in results:
-            if r["url"] not in seen:
-                seen.add(r["url"])
-                unique.append(r)
-        return unique
-
-    return await asyncio.to_thread(_search)
+def create_job_dir(chat_id: int) -> Path:
+    TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"job_{chat_id}_", dir=TMP_ROOT))
 
 
-def find_downloaded_file(video_id: str) -> str | None:
-    for file_path in DOWNLOAD_DIR.glob(f"{video_id}.*"):
-        return str(file_path)
-    return None
+def cleanup_path(path: Path | str | None) -> None:
+    if not path:
+        return
+
+    path = Path(path)
+
+    try:
+        if path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception as e:
+        logging.warning("Не удалось удалить %s: %s", path, e)
 
 
-async def download_audio(url: str):
-    def _download():
-        DOWNLOAD_DIR.mkdir(exist_ok=True)
+def cleanup_old_tmp_dirs() -> None:
+    TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    now = time.time()
 
-        with yt_dlp.YoutubeDL(AUDIO_DOWNLOAD_OPTS) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not info:
-                return None, None
-
-        video_id = info.get("id")
-        title = info.get("title", "Трек")
-
-        if not video_id:
-            return None, title
-
-        path = find_downloaded_file(video_id)
-        return path, title
-
-    return await asyncio.to_thread(_download)
+    for item in TMP_ROOT.iterdir():
+        try:
+            if now - item.stat().st_mtime > TMP_TTL_SECONDS:
+                cleanup_path(item)
+        except Exception as e:
+            logging.warning("Ошибка автоочистки %s: %s", item, e)
 
 
-async def download_video(url: str):
-    def _download():
-        DOWNLOAD_DIR.mkdir(exist_ok=True)
+async def periodic_cleanup() -> None:
+    while True:
+        await asyncio.to_thread(cleanup_old_tmp_dirs)
+        await asyncio.sleep(15 * 60)
 
-        with yt_dlp.YoutubeDL(VIDEO_DOWNLOAD_OPTS) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not info:
-                return None, None
 
-        video_id = info.get("id")
-        title = info.get("title", "Видео")
+def get_largest_media_file(workdir: Path) -> Path | None:
+    allowed_ext = {
+        ".mp3", ".m4a", ".opus", ".ogg", ".wav",
+        ".mp4", ".mov", ".mkv", ".webm",
+        ".jpg", ".jpeg", ".png", ".webp",
+    }
 
-        if not video_id:
-            return None, title
+    files = [
+        p for p in workdir.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() in allowed_ext
+        and not p.name.endswith(".part")
+    ]
 
-        path = find_downloaded_file(video_id)
-        return path, title
+    if not files:
+        return None
 
-    return await asyncio.to_thread(_download)
+    return max(files, key=lambda p: p.stat().st_size)
 
 
 def build_page_keyboard(tracks: list[dict], page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
@@ -195,7 +156,7 @@ def build_page_keyboard(tracks: list[dict], page: int = 0, per_page: int = 10) -
     page_tracks = tracks[start:end]
 
     buttons = []
-    for i, t in enumerate(page_tracks, start=start):
+    for i, track in enumerate(page_tracks, start=start):
         buttons.append([
             InlineKeyboardButton(
                 text=f"{i + 1}. {track['title'][:50]}",
@@ -204,22 +165,10 @@ def build_page_keyboard(tracks: list[dict], page: int = 0, per_page: int = 10) -
         ])
 
     nav = []
-
     if page > 0:
-        nav.append(
-            InlineKeyboardButton(
-                text="⬅️ Назад",
-                callback_data=f"page_{page - 1}",
-            )
-        )
-
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page_{page - 1}"))
     if page < total_pages - 1:
-        nav.append(
-            InlineKeyboardButton(
-                text="Вперёд ➡️",
-                callback_data=f"page_{page + 1}",
-            )
-        )
+        nav.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"page_{page + 1}"))
 
     if nav:
         buttons.append(nav)
@@ -241,14 +190,14 @@ def build_youtube_format_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def build_media_action_keyboard(url_key: str = "direct") -> InlineKeyboardMarkup:
+def build_media_action_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🎬 Скачать видео", callback_data=f"{url_key}_video"),
+                InlineKeyboardButton(text="🎬 Скачать видео", callback_data="direct_video"),
             ],
             [
-                InlineKeyboardButton(text="🎵 Попробовать как аудио", callback_data=f"{url_key}_audio"),
+                InlineKeyboardButton(text="🎵 Попробовать как аудио", callback_data="direct_audio"),
             ],
             [
                 InlineKeyboardButton(text="❌ Отмена", callback_data="cancel"),
@@ -274,15 +223,20 @@ async def check_file_or_report(path: Path, status) -> bool:
     return True
 
 
-# =========================
-# YT-DLP
-# =========================
-
 SEARCH_OPTS = {
     "quiet": True,
     "extract_flat": True,
     "noplaylist": True,
 }
+
+
+def ytdlp_base_opts() -> dict:
+    return {
+        "quiet": True,
+        "no_warnings": False,
+        "ignoreerrors": True,
+        "noplaylist": True,
+    }
 
 
 async def search_all(query: str, limit: int = 10) -> list[dict]:
@@ -325,12 +279,10 @@ async def search_all(query: str, limit: int = 10) -> list[dict]:
 
 
 def extract_metadata(url: str) -> dict | None:
-    opts = {
-        "quiet": True,
+    opts = ytdlp_base_opts()
+    opts.update({
         "skip_download": True,
-        "noplaylist": True,
-        "ignoreerrors": True,
-    }
+    })
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
@@ -351,12 +303,12 @@ def validate_metadata(info: dict | None) -> tuple[bool, str]:
     return True, ""
 
 
-async def download_audio(url: str) -> tuple[Path | None, str | None, Path | None, str | None]:
+async def download_audio(url: str, chat_id: int) -> tuple[Path | None, str | None, Path | None, str | None]:
     workdir = None
 
     def _download():
         nonlocal workdir
-        workdir = create_job_dir(chat_id=0)
+        workdir = create_job_dir(chat_id)
 
         info = extract_metadata(url)
         ok, error = validate_metadata(info)
@@ -365,12 +317,10 @@ async def download_audio(url: str) -> tuple[Path | None, str | None, Path | None
 
         title = safe_title(info.get("title") if info else None, "audio")
 
-        opts = {
+        opts = ytdlp_base_opts()
+        opts.update({
             "format": "bestaudio/best",
             "outtmpl": str(workdir / "%(title).120s_%(id)s.%(ext)s"),
-            "quiet": True,
-            "ignoreerrors": True,
-            "noplaylist": True,
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
@@ -378,7 +328,7 @@ async def download_audio(url: str) -> tuple[Path | None, str | None, Path | None
                     "preferredquality": "192",
                 }
             ],
-        }
+        })
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
@@ -389,12 +339,12 @@ async def download_audio(url: str) -> tuple[Path | None, str | None, Path | None
     return await asyncio.to_thread(_download)
 
 
-async def download_video(url: str) -> tuple[Path | None, str | None, Path | None, str | None]:
+async def download_video(url: str, chat_id: int) -> tuple[Path | None, str | None, Path | None, str | None]:
     workdir = None
 
     def _download():
         nonlocal workdir
-        workdir = create_job_dir(chat_id=0)
+        workdir = create_job_dir(chat_id)
 
         info = extract_metadata(url)
         ok, error = validate_metadata(info)
@@ -403,7 +353,8 @@ async def download_video(url: str) -> tuple[Path | None, str | None, Path | None
 
         title = safe_title(info.get("title") if info else None, "video")
 
-        opts = {
+        opts = ytdlp_base_opts()
+        opts.update({
             "format": (
                 "bestvideo[ext=mp4][height<=720][filesize<45M]+bestaudio[ext=m4a]/"
                 "best[ext=mp4][height<=720][filesize<45M]/"
@@ -411,11 +362,8 @@ async def download_video(url: str) -> tuple[Path | None, str | None, Path | None
                 "best"
             ),
             "outtmpl": str(workdir / "%(title).120s_%(id)s.%(ext)s"),
-            "quiet": True,
-            "ignoreerrors": True,
             "merge_output_format": "mp4",
-            "noplaylist": True,
-        }
+        })
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
@@ -425,10 +373,6 @@ async def download_video(url: str) -> tuple[Path | None, str | None, Path | None
 
     return await asyncio.to_thread(_download)
 
-
-# =========================
-# SENDERS
-# =========================
 
 async def send_audio_and_clean(chat_id: int, path: Path, status, title: str | None, workdir: Path | None):
     try:
@@ -477,7 +421,7 @@ async def run_download_job(message_or_callback_message: Message, url: str, mode:
     async with download_semaphore:
         if mode == "audio":
             status = await message_or_callback_message.answer("⏳ Скачиваю аудио...")
-            path, title, workdir, error = await download_audio(url)
+            path, title, workdir, error = await download_audio(url, chat_id)
 
             if error:
                 cleanup_path(workdir)
@@ -491,7 +435,7 @@ async def run_download_job(message_or_callback_message: Message, url: str, mode:
 
         if mode == "video":
             status = await message_or_callback_message.answer("⏳ Скачиваю видео...")
-            path, title, workdir, error = await download_video(url)
+            path, title, workdir, error = await download_video(url, chat_id)
 
             if error:
                 cleanup_path(workdir)
@@ -507,10 +451,8 @@ async def run_download_job(message_or_callback_message: Message, url: str, mode:
 
             return await send_video_and_clean(chat_id, path, status, title, workdir)
 
+        return await message_or_callback_message.answer("❌ Неизвестный режим скачивания.")
 
-# =========================
-# HANDLERS
-# =========================
 
 @dp.message(CommandStart())
 async def start(message: Message):
@@ -569,6 +511,9 @@ async def handle_message(message: Message):
 
 @dp.callback_query()
 async def handle_callback(callback: CallbackQuery):
+    if not callback.message:
+        return await callback.answer("Ошибка сообщения.", show_alert=True)
+
     chat_id = callback.message.chat.id
     data = callback.data or ""
 
@@ -628,72 +573,19 @@ async def handle_callback(callback: CallbackQuery):
             f"🎶 Результаты поиска, страница {page + 1}:",
             reply_markup=build_page_keyboard(tracks, page),
         )
-        await callback.answer()
+        return await callback.answer()
+
+    return await callback.answer("Неизвестная команда.", show_alert=True)
 
 
-async def _check_file_or_report(path: str, status) -> bool:
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        await status.edit_text("❌ Файл недоступен.")
-        return False
-
-    if size > MAX_FILE_SIZE:
-        await status.edit_text("⚠️ Файл слишком большой (>45 МБ).")
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        return False
-
-    return True
-
-
-async def _send_audio_and_clean(chat_id, path, status, title):
-    if not await _check_file_or_report(path, status):
-        return
-
-    try:
-        await bot.send_audio(chat_id, FSInputFile(path), title=title)
-    except Exception as e:
-        await status.edit_text(f"❌ Ошибка отправки аудио: {e}")
-    else:
-        await status.delete()
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-async def _send_video_and_clean(chat_id, path, status, title):
-    if not await _check_file_or_report(path, status):
-        return
-
-    try:
-        await bot.send_video(
-            chat_id,
-            FSInputFile(path),
-            caption=title[:1024] if title else None,
-            supports_streaming=True,
-        )
-    except Exception as e:
-        await status.edit_text(f"❌ Ошибка отправки видео: {e}")
-    else:
-        await status.delete()
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-# Заглушка для Render
 async def health(request):
     return web.Response(text="OK")
 
 
 async def main():
+    cleanup_old_tmp_dirs()
+    asyncio.create_task(periodic_cleanup())
+
     app = web.Application()
     app.router.add_get("/", health)
 
